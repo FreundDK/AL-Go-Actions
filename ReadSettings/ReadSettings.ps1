@@ -4,7 +4,7 @@ Param(
     [Parameter(HelpMessage = "The GitHub token running the action", Mandatory = $false)]
     [string] $token,
     [Parameter(HelpMessage = "Specifies the parent telemetry scope for the telemetry signal", Mandatory = $false)]
-    [string] $parentTelemetryScopeJson = '{}',
+    [string] $parentTelemetryScopeJson = '7b7d',
     [Parameter(HelpMessage = "Project folder", Mandatory = $false)]
     [string] $project = ".",
     [Parameter(HelpMessage = "Indicates whether you want to retrieve the list of project list as well", Mandatory = $false)]
@@ -61,8 +61,7 @@ try {
                     $settings.appRevision = [Int32]($ENV:GITHUB_RUN_ATTEMPT) - 1
                 }
                 1 { # Use RUN_ID and RUN_ATTEMPT
-                    $settings.appBuild = [Int32]($ENV:GITHUB_RUN_ID)
-                    $settings.appRevision = [Int32]($ENV:GITHUB_RUN_ATTEMPT) - 1
+                    OutputError -message "Versioning strategy 1 is no longer supported"
                 }
                 2 { # USE DATETIME
                     $settings.appBuild = [Int32]([DateTime]::UtcNow.ToString('yyyyMMdd'))
@@ -83,44 +82,65 @@ try {
     $outSettings = @{}
     $getSettings | ForEach-Object {
         $setting = $_.Trim()
-        $outSettings += @{ "$setting" = $settings."$setting" }
-        Add-Content -Path $env:GITHUB_ENV -Value "$setting=$($settings."$setting")"
+        $settingValue = $settings."$setting"
+        $outSettings += @{ "$setting" = $settingValue }
+        if ($settingValue -is [System.Collections.Specialized.OrderedDictionary]) {
+            Add-Content -Path $env:GITHUB_ENV -Value "$setting=$($settingValue | ConvertTo-Json -Compress)"
+        }
+        else {
+            Add-Content -Path $env:GITHUB_ENV -Value "$setting=$settingValue"
+        }
     }
 
     $outSettingsJson = $outSettings | ConvertTo-Json -Compress
-    Write-Host "::set-output name=SettingsJson::$outSettingsJson"
-    Write-Host "set-output name=SettingsJson::$outSettingsJson"
+    Add-Content -Path $env:GITHUB_OUTPUT -Value "SettingsJson=$outSettingsJson"
     Add-Content -Path $env:GITHUB_ENV -Value "Settings=$OutSettingsJson"
+    Write-Host "SettingsJson=$outSettingsJson"
 
     $gitHubRunner = $settings.githubRunner.Split(',').Trim() | ConvertTo-Json -compress
-    Write-Host "::set-output name=GitHubRunnerJson::$githubRunner"
-    Write-Host "set-output name=GitHubRunnerJson::$githubRunner"
+    Add-Content -Path $env:GITHUB_OUTPUT -Value "GitHubRunnerJson=$githubRunner"
+    Write-Host "GitHubRunnerJson=$githubRunner"
 
     if ($getprojects) {
+
         $buildProjects = @()
         if ($settings.Projects) {
             $projects = $settings.projects
         }
         else {
-            $projects = @(Get-ChildItem -Path $ENV:GITHUB_WORKSPACE -Directory -Recurse -Depth 2 | Where-Object { Test-Path (Join-Path $_.FullName ".AL-Go") -PathType Container } | ForEach-Object { $_.FullName.Substring("$ENV:GITHUB_WORKSPACE".length+1) })
+            $projects = @(Get-ChildItem -Path $ENV:GITHUB_WORKSPACE -Directory -Recurse -Depth 2 | Where-Object { Test-Path (Join-Path $_.FullName '.AL-Go\Settings.json') -PathType Leaf } | ForEach-Object { $_.FullName.Substring("$ENV:GITHUB_WORKSPACE".length+1) })
         }
         if ($projects) {
             Write-Host "All Projects: $($projects -join ', ')"
-            if (($ENV:GITHUB_EVENT_NAME -eq "pull_request" -or $ENV:GITHUB_EVENT_NAME -eq "push") -and !$settings.alwaysBuildAllProjects) {
-                $headers = @{             
-                    "Authorization" = "token $token"
-                    "Accept" = "application/vnd.github.baptiste-preview+json"
-                }
-                $ghEvent = Get-Content $ENV:GITHUB_EVENT_PATH -encoding UTF8 | ConvertFrom-Json
-                if ($ENV:GITHUB_EVENT_NAME -eq "pull_request") {
-                    $url = "$($ENV:GITHUB_API_URL)/repos/$($ENV:GITHUB_REPOSITORY)/compare/$($ghEvent.pull_request.base.sha)...$($ENV:GITHUB_SHA)"
+            if (!$settings.alwaysBuildAllProjects -and ($ENV:GITHUB_EVENT_NAME -eq "pull_request" -or $ENV:GITHUB_EVENT_NAME -eq "push" -or ($ENV:GITHUB_EVENT_NAME -eq "workflow_run" -and (Test-Path (Join-Path $ENV:GITHUB_WORKSPACE '.PullRequestFilesChanged'))))) {
+                if ($ENV:GITHUB_EVENT_NAME -eq "workflow_run" -and (Test-Path (Join-Path $ENV:GITHUB_WORKSPACE '.PullRequestFilesChanged'))) {
+                    $filesChanged = @(Get-Content (Join-Path $ENV:GITHUB_WORKSPACE '.PullRequestFilesChanged') -Encoding UTF8)
                 }
                 else {
-                    $url = "$($ENV:GITHUB_API_URL)/repos/$($ENV:GITHUB_REPOSITORY)/compare/$($ghEvent.before)...$($ghEvent.after)"
+                    $headers = @{             
+                        "Authorization" = "token $token"
+                        "Accept" = "application/vnd.github.baptiste-preview+json"
+                    }
+                    $ghEvent = Get-Content $ENV:GITHUB_EVENT_PATH -encoding UTF8 | ConvertFrom-Json
+                    if ($ENV:GITHUB_EVENT_NAME -eq "pull_request") {
+                        $url = "$($ENV:GITHUB_API_URL)/repos/$($ENV:GITHUB_REPOSITORY)/compare/$($ghEvent.pull_request.base.sha)...$($ENV:GITHUB_SHA)"
+                    }
+                    else {
+                        $url = "$($ENV:GITHUB_API_URL)/repos/$($ENV:GITHUB_REPOSITORY)/compare/$($ghEvent.before)...$($ghEvent.after)"
+                    }
+                    if ($ghEvent.before -eq '0'*40) {
+                        $filesChanged = @()
+                    }
+                    else {
+                        $response = InvokeWebRequest -Headers $headers -Uri $url | ConvertFrom-Json
+                        $filesChanged = @($response.files | ForEach-Object { $_.filename })
+                    }
                 }
-                $response = InvokeWebRequest -Headers $headers -Uri $url | ConvertFrom-Json
-                $filesChanged = @($response.files | ForEach-Object { $_.filename })
-                if ($filesChanged.Count -ge 250) {
+                if ($filesChanged.Count -eq 0) {
+                    Write-Host "Building all projects"
+                    $buildProjects = $projects
+                }
+                elseif ($filesChanged.Count -ge 250) {
                     Write-Host "More than 250 files modified, building all projects"
                     $buildProjects = $projects
                 }
@@ -130,10 +150,11 @@ try {
                     $buildProjects = @($projects | Where-Object {
                         $project = $_
                         $buildProject = $false
-                        $projectFolders = Get-ProjectFolders -baseFolder $ENV:GITHUB_WORKSPACE -project $project -token $token -includeAlGoFolder -includeApps -includeTestApps
-                        $projectFolders | Out-Host
-                        $projectFolders | ForEach-Object {
-                            if ($filesChanged -like "$_/*") { $buildProject = $true }
+                        if (Test-Path -path (Join-Path $ENV:GITHUB_WORKSPACE "$project\.AL-Go\Settings.json")) {
+                            $projectFolders = Get-ProjectFolders -baseFolder $ENV:GITHUB_WORKSPACE -project $project -token $token -includeAlGoFolder -includeApps -includeTestApps
+                            $projectFolders | ForEach-Object {
+                                if ($filesChanged -like "$_/*") { $buildProject = $true }
+                            }
                         }
                         $buildProject
                     })
@@ -142,6 +163,22 @@ try {
             }
             else {
                 $buildProjects = $projects
+            }
+            if ($settings.useProjectDependencies) {
+                $buildAlso = @{}
+                $buildOrder = @{}
+                $projectDependencies = @{}
+                AnalyzeProjectDependencies -basePath $ENV:GITHUB_WORKSPACE -projects $projects -buildOrder ([ref]$buildOrder) -buildAlso ([ref]$buildAlso) -projectDependencies ([ref]$projectDependencies)
+                $buildProjects = @($buildProjects | ForEach-Object { $_; if ($buildAlso.ContainsKey("$_")) { $buildAlso."$_" } } | Select-Object -Unique)
+                Write-Host "Building projects: $($buildProjects -join ', ')"
+                $projectDependenciesJson = $projectDependencies | ConvertTo-Json -Compress
+                $buildOrderJson = $buildOrder | ConvertTo-Json -Compress
+                Add-Content -Path $env:GITHUB_OUTPUT -Value "ProjectDependenciesJson=$projectDependenciesJson"
+                Add-Content -Path $env:GITHUB_OUTPUT -Value "BuildOrderJson=$buildOrderJson"
+                Add-Content -Path $env:GITHUB_OUTPUT -Value "BuildOrderDepth=$($buildOrder.Count)"
+                Write-Host "ProjectDependenciesJson=$projectDependenciesJson"
+                Write-Host "BuildOrderJson=$buildOrderJson"
+                Write-Host "BuildOrderDepth=$($buildOrder.Count)"
             }
         }
         if (Test-Path ".AL-Go" -PathType Container) {
@@ -153,11 +190,11 @@ try {
         else {
             $projectsJSon = $buildProjects | ConvertTo-Json -compress
         }
-        Write-Host "::set-output name=ProjectsJson::$projectsJson"
-        Write-Host "set-output name=ProjectsJson::$projectsJson"
-        Write-Host "::set-output name=ProjectCount::$($buildProjects.Count)"
-        Write-Host "set-output name=ProjectCount::$($buildProjects.Count)"
+        Add-Content -Path $env:GITHUB_OUTPUT -Value "ProjectsJson=$projectsJson"
         Add-Content -Path $env:GITHUB_ENV -Value "Projects=$projectsJson"
+        Write-Host "ProjectsJson=$projectsJson"
+        Add-Content -Path $env:GITHUB_OUTPUT -Value "ProjectCount=$($buildProjects.Count)"
+        Write-Host "ProjectCount=$($buildProjects.Count)"
     }
 
     if ($getenvironments) {
@@ -171,30 +208,46 @@ try {
             $environments = @((InvokeWebRequest -Headers $headers -Uri $url -ignoreErrors | ConvertFrom-Json).environments | ForEach-Object { $_.Name })
         } 
         catch {}
-        $environments = @($environments+@($settings.Environments) | Where-Object { 
+        $environments = @($environments+@($settings.Environments) | Where-Object { $_ -ne "github-pages" } | Where-Object { 
             if ($includeProduction) {
                 $_ -like $getEnvironments -or $_ -like "$getEnvironments (PROD)" -or $_ -like "$getEnvironments (Production)" -or $_ -like "$getEnvironments (FAT)" -or $_ -like "$getEnvironments (Final Acceptance Test)"
             }
             else {
                 $_ -like $getEnvironments -and $_ -notlike '* (PROD)' -and $_ -notlike '* (Production)' -and $_ -notlike '* (FAT)' -and $_ -notlike '* (Final Acceptance Test)'
             }
+        } | Where-Object {
+            $branches = @( 'main' )
+            $environmentName = $_.Split(' ')[0]
+            $deployToName = "DeployTo$environmentName"
+            if (($settings.Contains($deployToName)) -and ($settings."$deployToName".Contains('Branches'))) {
+                $branches = @($settings."$deployToName".Branches)
+            }
+            $branches | Out-Host
+            $includeEnvironment = $false
+            $branches | ForEach-Object {
+                if ($ENV:GITHUB_REF_NAME -like $_) {
+                    $includeEnvironment = $true
+                }
+            }
+            $includeEnvironment
         })
 
         $json = @{"matrix" = @{ "include" = @() }; "fail-fast" = $false }
         $environments | Select-Object -Unique | ForEach-Object { 
-            $environmentGitHubRunnerKey = "$($_.Split(' ')[0])_GitHubRunner"
-            $os = $settings."runs-on".Split(',').Trim()
-            if (([HashTable]$settings).ContainsKey($environmentGitHubRunnerKey)) {
-                $os = $settings."$environmentGitHubRunnerKey".Split(',').Trim()
+            $environmentName = $_.Split(' ')[0]
+            $deployToName = "DeployTo$environmentName"
+            $runson = $settings."runs-on".Split(',').Trim()
+            if (($settings.Contains($deployToName)) -and ($settings."$deployToName".Contains('runs-on'))) {
+                $runson = $settings."$deployToName"."runs-on"
             }
-            $json.matrix.include += @{ "environment" = $_; "os" = "$($os | ConvertTo-Json -compress)" }
+            $json.matrix.include += @{ "environment" = $_; "os" = "$($runson | ConvertTo-Json -compress)" }
         }
         $environmentsJson = $json | ConvertTo-Json -Depth 99 -compress
-        Write-Host "::set-output name=EnvironmentsJson::$environmentsJson"
-        Write-Host "set-output name=EnvironmentsJson::$environmentsJson"
-        Write-Host "::set-output name=EnvironmentCount::$($environments.Count)"
-        Write-Host "set-output name=EnvironmentCount::$($environments.Count)"
+        Add-Content -Path $env:GITHUB_OUTPUT -Value "EnvironmentsJson=$environmentsJson"
         Add-Content -Path $env:GITHUB_ENV -Value "Environments=$environmentsJson"
+        Write-Host "EnvironmentsJson=$environmentsJson"
+        Add-Content -Path $env:GITHUB_OUTPUT -Value "EnvironmentCount=$($environments.Count)"
+        Write-Host "EnvironmentCount=$($environments.Count)"
     }
 
     TrackTrace -telemetryScope $telemetryScope

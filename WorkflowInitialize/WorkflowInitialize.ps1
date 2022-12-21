@@ -41,28 +41,19 @@ try {
         AddTelemetryProperty -telemetryScope $telemetryScope -key "runNumber" -value $ENV:GITHUB_RUN_NUMBER
         AddTelemetryProperty -telemetryScope $telemetryScope -key "runId" -value $ENV:GITHUB_RUN_ID
         
-        $scopeJson = $telemetryScope | ConvertTo-Json -Compress
+        $scopeJson = strToHexStr -str ($telemetryScope | ConvertTo-Json -Compress)
         $correlationId = ($telemetryScope.CorrelationId).ToString()
     }
     else {
-        $scopeJson = "{}"
+        $scopeJson = '7b7d'
         $correlationId = [guid]::Empty.ToString()
     }
 
-    Write-Host "  __  __              _                            "
-    Write-Host " |  \/  |            | |                           "
-    Write-Host " | \  / |_   _    ___| |__   __ _ _ __   __ _  ___ "
-    Write-Host " | |\/| | | | |  / __| '_ \ / _` | '_ \ / _` |/ _ \"
-    Write-Host " | |  | | |_| | | (__| | | | (_| | | | | (_| |  __/"
-    Write-Host " |_|  |_|\__, |  \___|_| |_|\__,_|_| |_|\__, |\___|"
-    Write-Host "          __/ |                          __/ |     "
-    Write-Host "         |___/                          |___/      "
+    Add-Content -Path $env:GITHUB_OUTPUT -Value "telemetryScopeJson=$scopeJson"
+    Write-Host "telemetryScopeJson=$scopeJson"
 
-    Write-Host "::set-output name=telemetryScopeJson::$scopeJson"
-    Write-Host "set-output name=telemetryScopeJson::$scopeJson"
-
-    Write-Host "::set-output name=correlationId::$correlationId"
-    Write-Host "set-output name=correlationId::$correlationId"
+    Add-Content -Path $env:GITHUB_OUTPUT -Value "correlationId=$correlationId"
+    Write-Host "correlationId=$correlationId"
 
 }
 catch {

@@ -4,9 +4,9 @@ Param(
     [Parameter(HelpMessage = "The GitHub token running the action", Mandatory = $false)]
     [string] $token,
     [Parameter(HelpMessage = "Specifies the parent telemetry scope for the telemetry signal", Mandatory = $false)]
-    [string] $parentTelemetryScopeJson = '{}',
-    [Parameter(HelpMessage = "Projects to deploy (default is all)", Mandatory = $false)]
-    [string] $projects = "*",
+    [string] $parentTelemetryScopeJson = '7b7d',
+    [Parameter(HelpMessage = "Projects to deploy", Mandatory = $false)]
+    [string] $projects = '',
     [Parameter(HelpMessage = "Name of environment to deploy to", Mandatory = $true)]
     [string] $environmentName,
     [Parameter(HelpMessage = "Artifacts to deploy", Mandatory = $true)]
@@ -21,6 +21,11 @@ Set-StrictMode -Version 2.0
 $telemetryScope = $null
 $bcContainerHelperPath = $null
 
+if ($projects -eq '') {
+    Write-Host "No projects to deploy"
+}
+else {
+
 # IMPORTANT: No code that can fail should be outside the try/catch
 
 try {
@@ -32,21 +37,21 @@ try {
 
     $EnvironmentName = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($environmentName))
 
-    if ($projects -eq '') { $projects = "*" }
-
     $apps = @()
-    $baseFolder = Join-Path $ENV:GITHUB_WORKSPACE "artifacts"
+    $baseFolder = Join-Path $ENV:GITHUB_WORKSPACE ".artifacts"
+    $baseFolderCreated = $false
 
-    if ($artifacts -like "$($baseFolder)*") {
+    if ($artifacts -like "$($ENV:GITHUB_WORKSPACE)*") {
         if (Test-Path $artifacts -PathType Container) {
             $projects.Split(',') | ForEach-Object {
                 $project = $_.Replace('\','_')
+                $refname = "$ENV:GITHUB_REF_NAME".Replace('/','_')
                 Write-Host "project '$project'"
-                $apps += @((Get-ChildItem -Path $artifacts -Filter "$project-*-Apps-*") | ForEach-Object { $_.FullName })
+                $apps += @((Get-ChildItem -Path $artifacts -Filter "$project-$refname-Apps-*.*.*.*") | ForEach-Object { $_.FullName })
                 if (!($apps)) {
-                    throw "There is no artifacts present in $artifacts."
+                    throw "There is no artifacts present in $artifacts matching $project-$refname-Apps-<version>."
                 }
-                $apps += @((Get-ChildItem -Path $artifacts -Filter "$project-*-Dependencies-*") | ForEach-Object { $_.FullName })
+                $apps += @((Get-ChildItem -Path $artifacts -Filter "$project-$refname-Dependencies-*.*.*.*") | ForEach-Object { $_.FullName })
             }
         }
         elseif (Test-Path $artifacts) {
@@ -72,6 +77,7 @@ try {
             throw "Unable to locate $artifacts release"
         }
         New-Item $baseFolder -ItemType Directory | Out-Null
+        $baseFolderCreated = $true
         DownloadRelease -token $token -projects $projects -api_url $ENV:GITHUB_API_URL -repository $ENV:GITHUB_REPOSITORY -release $release -path $baseFolder -mask "Apps"
         DownloadRelease -token $token -projects $projects -api_url $ENV:GITHUB_API_URL -repository $ENV:GITHUB_REPOSITORY -release $release -path $baseFolder -mask "Dependencies"
         $apps = @((Get-ChildItem -Path $baseFolder) | ForEach-Object { $_.FullName })
@@ -81,6 +87,7 @@ try {
     }
     else {
         New-Item $baseFolder -ItemType Directory | Out-Null
+        $baseFolderCreated = $true
         $allArtifacts = @(GetArtifacts -token $token -api_url $ENV:GITHUB_API_URL -repository $ENV:GITHUB_REPOSITORY -mask "Apps" -projects $projects -Version $artifacts -branch "main")
         $allArtifacts += @(GetArtifacts -token $token -api_url $ENV:GITHUB_API_URL -repository $ENV:GITHUB_REPOSITORY -mask "Dependencies" -projects $projects -Version $artifacts -branch "main")
         if ($allArtifacts) {
@@ -100,7 +107,7 @@ try {
     Write-Host "Apps to deploy"
     $apps | Out-Host
 
-    Set-Location $baseFolder
+    Set-Location $ENV:GITHUB_WORKSPACE
     if (-not ($ENV:AUTHCONTEXT)) {
         throw "An environment secret for environment($environmentName) called AUTHCONTEXT containing authentication information for the environment was not found.You must create an environment secret."
     }
@@ -152,6 +159,10 @@ try {
         exit
     }
 
+    if ($baseFolderCreated) {
+        Remove-Item $baseFolder -Recurse -Force
+    }
+
     TrackTrace -telemetryScope $telemetryScope
 
 }
@@ -161,4 +172,5 @@ catch {
 }
 finally {
     CleanupAfterBcContainerHelper -bcContainerHelperPath $bcContainerHelperPath
+}
 }

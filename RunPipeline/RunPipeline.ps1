@@ -4,9 +4,11 @@ Param(
     [Parameter(HelpMessage = "The GitHub token running the action", Mandatory = $false)]
     [string] $token,
     [Parameter(HelpMessage = "Specifies the parent telemetry scope for the telemetry signal", Mandatory = $false)]
-    [string] $parentTelemetryScopeJson = '{}',
+    [string] $parentTelemetryScopeJson = '7b7d',
     [Parameter(HelpMessage = "Project folder", Mandatory = $false)]
     [string] $project = "",
+    [Parameter(HelpMessage = "Project Dependencies in compressed Json format", Mandatory = $false)]
+    [string] $projectDependenciesJson = "",
     [Parameter(HelpMessage = "Settings from repository in compressed Json format", Mandatory = $false)]
     [string] $settingsJson = '{"AppBuild":"", "AppRevision":""}',
     [Parameter(HelpMessage = "Secrets from repository in compressed Json format", Mandatory = $false)]
@@ -57,14 +59,14 @@ try {
     if ($project) {
         $sharedFolder = $baseFolder
     }
-    $workflowName = $env:GITHUB_WORKFLOW
+    $workflowName = "$env:GITHUB_WORKFLOW".Trim()
 
     Write-Host "use settings and secrets"
     $settings = $settingsJson | ConvertFrom-Json | ConvertTo-HashTable
     $secrets = $secretsJson | ConvertFrom-Json | ConvertTo-HashTable
     $appBuild = $settings.appBuild
     $appRevision = $settings.appRevision
-    'licenseFileUrl','insiderSasToken','CodeSignCertificateUrl','CodeSignCertificatePassword','KeyVaultCertificateUrl','KeyVaultCertificatePassword','KeyVaultClientId','StorageContext','ApplicationInsightsConnectionString' | ForEach-Object {
+    'licenseFileUrl','insiderSasToken','CodeSignCertificateUrl','CodeSignCertificatePassword','KeyVaultCertificateUrl','KeyVaultCertificatePassword','KeyVaultClientId','StorageContext','GitHubPackagesContext','ApplicationInsightsConnectionString' | ForEach-Object {
         if ($secrets.ContainsKey($_)) {
             $value = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($secrets."$_"))
         }
@@ -91,14 +93,52 @@ try {
     $installApps = $repo.installApps
     $installTestApps = $repo.installTestApps
 
-    if ($repo.appDependencyProbingPaths) {
-        Write-Host "Downloading dependencies ..."
-        $installApps += Get-dependencies -probingPathsJson $repo.appDependencyProbingPaths -mask "Apps"
-        Get-dependencies -probingPathsJson $repo.appDependencyProbingPaths -mask "TestApps" | ForEach-Object {
-            $installTestApps += "($_)"
+    Write-Host "Project: $project"
+    if ($project -and $repo.useProjectDependencies -and $projectDependenciesJson -ne "") {
+        $projectDependencies = $projectDependenciesJson | ConvertFrom-Json | ConvertTo-HashTable
+        if ($projectDependencies.ContainsKey($project)) {
+            $projects = @($projectDependencies."$project") -join ","
+        }
+        else {
+            $projects = ''
+        }
+        if ($projects) {
+            Write-Host "Project dependencies: $projects"
+            $thisBuildProbingPaths = @(@{
+                "release_status" = "thisBuild"
+                "version" = "latest"
+                "projects" = $projects
+                "repo" = "$ENV:GITHUB_SERVER_URL/$ENV:GITHUB_REPOSITORY"
+                "branch" = $ENV:GITHUB_REF_NAME
+                "authTokenSecret" = $token
+            })
+            Get-dependencies -probingPathsJson $thisBuildProbingPaths | where-Object { $_ } | ForEach-Object {
+                if ($_.startswith('(')) {
+                    $installTestApps += $_    
+                }
+                else {
+                    $installApps += $_    
+                }
+            }
+        }
+        else {
+            Write-Host "No project dependencies"
         }
     }
-    
+
+    if ($repo.appDependencyProbingPaths) {
+        Write-Host "::group::Downloading dependencies"
+        Get-dependencies -probingPathsJson $repo.appDependencyProbingPaths | ForEach-Object {
+            if ($_.startswith('(')) {
+                $installTestApps += $_    
+            }
+            else {
+                $installApps += $_    
+            }
+        }
+        Write-Host "::endgroup::"
+    }
+
     # Analyze app.json version dependencies before launching pipeline
 
     # Analyze InstallApps and InstallTestApps before launching pipeline
@@ -130,6 +170,7 @@ try {
         OutputWarning -message "Skipping upgrade tests"
     }
     else {
+        Write-Host "::group::Locating previous release"
         try {
             $releasesJson = GetReleases -token $token -api_url $ENV:GITHUB_API_URL -repository $ENV:GITHUB_REPOSITORY
             if ($env:GITHUB_REF_NAME -like 'release/*') {
@@ -154,6 +195,7 @@ try {
             OutputError -message "Error trying to locate previous release. Error was $($_.Exception.Message)"
             exit
         }
+        Write-Host "::endgroup::"
     }
 
     $additionalCountries = $repo.additionalCountries
@@ -162,7 +204,9 @@ try {
     if ($repo.gitHubRunner -ne "windows-latest") {
         $imageName = $repo.cacheImageName
         if ($imageName) {
+            Write-Host "::group::Flush ContainerHelper Cache"
             Flush-ContainerHelperCache -keepdays $repo.cacheKeepDays
+            Write-Host "::endgroup::"
         }
     }
     $authContext = $null
@@ -194,6 +238,7 @@ try {
     }
 
     $buildOutputFile = Join-Path $projectPath "BuildOutput.txt"
+    $containerEventLogFile = Join-Path $projectPath "ContainerEventLog.evtx"
 
     "containerName=$containerName" | Add-Content $ENV:GITHUB_ENV
 
@@ -208,7 +253,78 @@ try {
             }
         }
     }
-    
+
+    if (-not $runAlPipelineParams.ContainsKey('RemoveBcContainer')) {
+        $runAlPipelineParams += @{
+            "RemoveBcContainer" = {
+                Param([Hashtable]$parameters)
+                Remove-BcContainerSession -containerName $parameters.ContainerName -killPsSessionProcess
+                Remove-BcContainer @parameters
+            }
+        }
+    }
+
+    if (-not $runAlPipelineParams.ContainsKey('ImportTestDataInBcContainer')) {
+        if (($repo.configPackages) -or ($repo.Keys | Where-Object { $_ -like 'configPackages.*' })) {
+            Write-Host "Adding Import Test Data override"
+            Write-Host "Configured config packages:"
+            $repo.Keys | Where-Object { $_ -like 'configPackages*' } | ForEach-Object {
+                Write-Host "- $($_):"
+                $repo."$_" | ForEach-Object {
+                    Write-Host "  - $_"
+                }
+            }
+            $runAlPipelineParams += @{
+                "ImportTestDataInBcContainer" = {
+                    Param([Hashtable]$parameters)
+                    $country = Get-BcContainerCountry -containerOrImageName $parameters.containerName
+                    $prop = "configPackages.$country"
+                    if (-not $repo.ContainsKey($prop)) {
+                        $prop = "configPackages"
+                    }
+                    if ($repo."$prop") {
+                        Write-Host "Importing config packages from $prop"
+                        $repo."$prop" | ForEach-Object {
+                            $configPackage = $_.Split(',')[0].Replace('{COUNTRY}',$country)
+                            $packageId = $_.Split(',')[1]
+                            UploadImportAndApply-ConfigPackageInBcContainer `
+                                -containerName $parameters.containerName `
+                                -Credential $parameters.credential `
+                                -Tenant $parameters.tenant `
+                                -ConfigPackage $configPackage `
+                                -PackageId $packageId
+                        }
+                    }
+               }
+            }
+        }
+    }
+
+    if ($gitHubPackagesContext -and (-not $runAlPipelineParams.ContainsKey('InstallMissingDependencies'))) {
+        $gitHubPackagesCredential = $gitHubPackagesContext | ConvertFrom-Json
+        $runAlPipelineParams += @{
+            "InstallMissingDependencies" = {
+                Param([Hashtable]$parameters)
+                $parameters.missingDependencies | ForEach-Object {
+                    $publishParams = @{
+                        "containerName" = $parameters.containerName
+                        "tenant" = $parameters.tenant
+                    }
+                    $appid = $_.Split(':')[0]
+                    $appName = $_.Split(':')[1]
+                    $version = $appName.SubString($appName.LastIndexOf('_')+1)
+                    $version = [System.Version]$version.SubString(0,$version.Length-4)
+                    if ($parameters.ContainsKey('CopyInstalledAppsToFolder')) {
+                        $publishParams += @{
+                            "CopyInstalledAppsToFolder" = $parameters.CopyInstalledAppsToFolder
+                        }
+                    }
+                    Publish-BcNuGetPackageToContainer @publishParams -nuGetServerUrl $gitHubPackagesCredential.serverUrl -nuGetToken $gitHubPackagesCredential.token -PackageName "AL-Go-$appId" -version $version -skipVerification
+                }
+            }
+        }
+    }
+
     "doNotBuildTests",
     "doNotRunTests",
     "doNotRunBcptTests",
@@ -247,11 +363,13 @@ try {
         -testFolders $repo.testFolders `
         -bcptTestFolders $repo.bcptTestFolders `
         -buildOutputFile $buildOutputFile `
+        -containerEventLogFile $containerEventLogFile `
         -testResultsFile $testResultsFile `
         -testResultsFormat 'JUnit' `
         -customCodeCops $repo.customCodeCops `
         -gitHubActions `
         -failOn $repo.failOn `
+        -treatTestFailuresAsWarnings:$repo.treatTestFailuresAsWarnings `
         -rulesetFile $repo.rulesetFile `
         -AppSourceCopMandatoryAffixes $repo.appSourceCopMandatoryAffixes `
         -additionalCountries $additionalCountries `
@@ -259,8 +377,7 @@ try {
         -buildArtifactFolder $buildArtifactFolder `
         -CreateRuntimePackages:$CreateRuntimePackages `
         -appBuild $appBuild -appRevision $appRevision `
-        -uninstallRemovedApps `
-        -RemoveBcContainer { Param([Hashtable]$parameters) Remove-BcContainerSession -containerName $parameters.ContainerName -killPsSessionProcess; Remove-BcContainer @parameters }
+        -uninstallRemovedApps
 
     if ($containerBaseFolder) {
 
@@ -270,7 +387,8 @@ try {
         Copy-Item -Path (Join-Path $projectPath ".output") -Destination $destFolder -Recurse -Force
         Copy-Item -Path (Join-Path $projectPath "testResults*.xml") -Destination $destFolder
         Copy-Item -Path (Join-Path $projectPath "bcptTestResults*.json") -Destination $destFolder
-        Copy-Item -Path (Join-Path $projectPath "buildoutput.txt") -Destination $destFolder
+        Copy-Item -Path $buildOutputFile -Destination $destFolder -Force -ErrorAction SilentlyContinue
+        Copy-Item -Path $containerEventLogFile -Destination $destFolder -Force -ErrorAction SilentlyContinue
     }
 
     TrackTrace -telemetryScope $telemetryScope
@@ -280,6 +398,16 @@ catch {
     TrackException -telemetryScope $telemetryScope -errorRecord $_
 }
 finally {
+    try {
+        if (Test-BcContainer -containerName $containerName) {
+            Write-Host "Get Event Log from container"
+            $eventlogFile = Get-BcContainerEventLog -containerName $containerName -doNotOpen
+            Copy-Item -Path $eventLogFile -Destination $containerEventLogFile
+            $destFolder = Join-Path $ENV:GITHUB_WORKSPACE $project
+            Copy-Item -Path $containerEventLogFile -Destination $destFolder
+        }
+    }
+    catch {}
     CleanupAfterBcContainerHelper -bcContainerHelperPath $bcContainerHelperPath
     if ($containerBaseFolder -and (Test-Path $containerBaseFolder) -and $projectPath -and (Test-Path $projectPath)) {
         Write-Host "Removing temp folder"

@@ -107,7 +107,7 @@ function MaskValueInLog {
     )
 
     if (!$runningLocal) {
-        Write-Host "::add-mask::$value"
+        Write-Host "`r::add-mask::$value"
     }
 }
 
@@ -203,22 +203,29 @@ function DownloadAndImportBcContainerHelper {
         if (Test-Path $repoSettingsPath) {
             if (-not $BcContainerHelperVersion) {
                 $repoSettings = Get-Content $repoSettingsPath -Encoding UTF8 | ConvertFrom-Json | ConvertTo-HashTable
+                Write-Host $ENV:GITHUB_ACTION_PATH
                 $ap = "$ENV:GITHUB_ACTION_PATH".Split('\')
                 if ($ap -and $ap.Count -gt 4) {
-                    $branch = $ap[$ap.Count-2]
+                    $folder = $ap[$ap.Count-5]
                     $owner = $ap[$ap.Count-4]
-                    if ($owner -eq "freddydk") {
-                        $bcContainerHelperVersion = "dev"
-                    }
-                    elseif ($owner -eq "businesscentralapps") {
-                        $bcContainerHelperVersion = "preview"
-                    }
-                    elseif ($owner -eq "microsoft" -and $branch -eq "preview") {
-                        $bcContainerHelperVersion = "preview"
+                    $repo = $ap[$ap.Count-3]
+                    $branch = $ap[$ap.Count-2]
+                    if ($folder -eq "_actions" -and $repo -eq "AL-Go-Actions") {
+                        if ($owner -eq "microsoft") {
+                            if ($branch -eq "preview") {
+                                $bcContainerHelperVersion = "preview"
+                            }
+                        }
+                        else {
+                            $bcContainerHelperVersion = "https://github.com/$owner/navcontainerhelper/archive/master.zip"
+                        }
                     }
                 }
                 if ($bcContainerHelperVersion -eq "" -and $repoSettings.ContainsKey("BcContainerHelperVersion")) {
                     $BcContainerHelperVersion = $repoSettings.BcContainerHelperVersion
+                    if ($BcContainerHelperVersion -like "https://*") {
+                        throw "Setting BcContainerHelperVersion to a URL is not allowed."
+                    }
                 }
             }
             $params += @{ "bcContainerHelperConfigFile" = $repoSettingsPath }
@@ -240,23 +247,31 @@ function DownloadAndImportBcContainerHelper {
     else {
         $tempName = Join-Path $env:TEMP ([Guid]::NewGuid().ToString())
         $webclient = New-Object System.Net.WebClient
-        if ($BcContainerHelperVersion -eq "dev") {
-            Write-Host "Downloading BcContainerHelper developer version"
-            $webclient.DownloadFile("https://github.com/microsoft/navcontainerhelper/archive/dev.zip", "$tempName.zip")
-        }
-        else {
-            Write-Host "Downloading BcContainerHelper $BcContainerHelperVersion version"
+        if ($BcContainerHelperVersion -like "https://*") {
+            Write-Host "Downloading BcContainerHelper developer version from $BcContainerHelperVersion"
             try {
-                $webclient.DownloadFile("https://bccontainerhelper.azureedge.net/public/$($BcContainerHelperVersion).zip", "$tempName.zip")
+                $webclient.DownloadFile($BcContainerHelperVersion, "$tempName.zip")
             }
             catch {
-                $webclient.DownloadFile("https://bccontainerhelper.blob.core.windows.net/public/$($BcContainerHelperVersion).zip", "$tempName.zip")        
+                Write-Host "Download failed, downloading BcContainerHelper $BcContainerHelperVersion version from Blob Storage"
+                $webclient.DownloadFile("https://bccontainerhelper.blob.core.windows.net/public/$($BcContainerHelperVersion).zip", "$tempName.zip")
             }
         }
+        elseif ($BcContainerHelperVersion -eq "dev") {
+            Write-Host "Downloading BcContainerHelper dev branch"
+            $webclient.DownloadFile("https://github.com/freddydk/navcontainerhelper/archive/master.zip", "$tempName.zip")
+        }
+        elseif ($BcContainerHelperVersion -eq "preview") {
+            Write-Host "Downloading BcContainerHelper $BcContainerHelperVersion version from Blob Storage"
+            $webclient.DownloadFile("https://bccontainerhelper.blob.core.windows.net/public/$($BcContainerHelperVersion).zip", "$tempName.zip")
+        }
+        else {
+            Write-Host "Downloading BcContainerHelper $BcContainerHelperVersion version from CDN"
+            $webclient.DownloadFile("https://bccontainerhelper.azureedge.net/public/$($BcContainerHelperVersion).zip", "$tempName.zip")
+        }
         Expand-7zipArchive -Path "$tempName.zip" -DestinationPath $tempName
-        Remove-Item -Path "$tempName.zip"
-
         $BcContainerHelperPath = (Get-Item -Path (Join-Path $tempName "*\BcContainerHelper.ps1")).FullName
+        Remove-Item -Path "$tempName.zip" -ErrorAction SilentlyContinue
     }
     . $BcContainerHelperPath @params
     $tempName
@@ -394,18 +409,21 @@ function ReadSettings {
         "enableUICop"                            = $false
         "customCodeCops"                         = @()
         "failOn"                                 = "error"
+        "treatTestFailuresAsWarnings"            = $false
         "rulesetFile"                            = ""
         "doNotBuildTests"                        = $false
         "doNotRunTests"                          = $false
         "doNotRunBcptTests"                      = $false
         "doNotPublishApps"                       = $false
         "doNotSignApps"                          = $false
+        "configPackages"                         = @()
         "appSourceCopMandatoryAffixes"           = @()
         "obsoleteTagMinAllowedMajorMinor"        = ""
         "memoryLimit"                            = ""
         "templateUrl"                            = ""
         "templateBranch"                         = ""
         "appDependencyProbingPaths"              = @()
+        "useProjectDependencies"                 = $false
         "runs-on"                                = "windows-latest"
         "githubRunner"                           = ""
         "cacheImageName"                         = "my"
@@ -427,7 +445,7 @@ function ReadSettings {
         }
     }
 
-    $workflowName = $workflowName.Split([System.IO.Path]::getInvalidFileNameChars()) -join ""
+    $workflowName = $workflowName.Trim().Split([System.IO.Path]::getInvalidFileNameChars()) -join ""
     $RepoSettingsPath, $ALGoSettingsFile, (Join-Path $gitHubFolder "$workflowName.settings.json"), (Join-Path $ALGoFolder "$workflowName.settings.json"), (Join-Path $ALGoFolder "$userName.settings.json") | ForEach-Object {
         $settingsFile = $_
         $settingsPath = Join-Path $baseFolder $settingsFile
@@ -620,7 +638,7 @@ function AnalyzeRepo {
                     try {
                         $appJson = Get-Content $appJsonFile -Encoding UTF8 | ConvertFrom-Json
                         if ($appIdFolders.Contains($appJson.Id)) {
-                            throw "$descr $folderName contains a duplicate AppId ($($appIdFolders."$appJson.Id"))"
+                            throw "$descr $folderName contains a duplicate AppId ($($appIdFolders."$($appJson.Id)"))"
                         }
                         $appIdFolders.Add($appJson.Id, $folderName)
                         if ($appJson.PSObject.Properties.Name -eq 'Dependencies') {
@@ -812,6 +830,10 @@ function AnalyzeRepo {
         Write-Host "::endgroup::"
     }
 
+    Write-Host "Checking project dependencies"
+
+
+
     Write-Host "Checking appDependencyProbingPaths"
     if ($settings.appDependencyProbingPaths) {
         $settings.appDependencyProbingPaths = @($settings.appDependencyProbingPaths | ForEach-Object {
@@ -967,8 +989,6 @@ function Get-ProjectFolders {
         }
     }
 
-    Write-Host "Project $project folders:"
-    $projectFolders | ForEach-Object { Write-Host "- $_" }
     $projectFolders
 }
 
@@ -1413,9 +1433,13 @@ function CreateDevEnv {
                     New-Object -Type PSObject -Property $_
                 } 
             })
-            $installApps += Get-dependencies -probingPathsJson $repo.appDependencyProbingPaths -mask "Apps" -saveToPath $dependenciesFolder -api_url 'https://api.github.com'
-            Get-dependencies -probingPathsJson $repo.appDependencyProbingPaths -mask "TestApps" -saveToPath $dependenciesFolder -api_url 'https://api.github.com' | ForEach-Object {
-                $installTestApps += "($_)"
+            Get-dependencies -probingPathsJson $repo.appDependencyProbingPaths -saveToPath $dependenciesFolder -api_url 'https://api.github.com' | ForEach-Object {
+                if ($_.startswith('(')) {
+                    $installTestApps += $_    
+                }
+                else {
+                    $installApps += $_    
+                }
             }
         }
     
@@ -1557,6 +1581,7 @@ function CreateDevEnv {
             -gitLab:($caller -eq 'GitLab') `
             -gitHubActions:($caller -eq 'GitHubActions') `
             -failOn $repo.failOn `
+            -treatTestFailuresAsWarnings:$repo.treatTestFailuresAsWarnings `
             -rulesetFile $repo.rulesetFile `
             -AppSourceCopMandatoryAffixes $repo.appSourceCopMandatoryAffixes `
             -obsoleteTagMinAllowedMajorMinor $repo.obsoleteTagMinAllowedMajorMinor `
@@ -1610,5 +1635,72 @@ function CheckAndCreateProjectFolder {
                 Set-Location $project
             }
         }
+    }
+}
+
+Function AnalyzeProjectDependencies {
+    Param(
+        [string] $basePath,
+        [string[]] $projects,
+        [ref] $buildOrder,
+        [ref] $buildAlso,
+        [ref] $projectDependencies
+    )
+
+    $appDependencies = @{}
+    Write-Host "Analyzing projects"
+    $projects | ForEach-Object {
+        $project = $_
+        Write-Host "- $project"
+        $apps = @()
+        $folders = @(Get-ChildItem -Path (Join-Path $basePath $project) -Recurse -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'app.json') } | ForEach-Object { $_.FullName.Substring($basePath.Length+1) } )
+        $unknownDependencies = @()
+        $apps = @()
+        $sortedFolders = Sort-AppFoldersByDependencies -appFolders $folders -baseFolder $basePath -WarningAction SilentlyContinue -unknownDependencies ([ref]$unknownDependencies) -knownApps ([ref]$apps)
+        $appDependencies."$project" = @{
+            "apps" = $apps
+            "dependencies" = @($unknownDependencies | ForEach-Object { $_.Split(':')[0] })
+        }
+    }
+    $no = 1
+    Write-Host "Analyzing dependencies"
+    while ($projects.Count -gt 0) {
+        $thisJob = @()
+        $projects | ForEach-Object {
+            $project = $_
+            Write-Host "- $project"
+            $dependencies = $appDependencies."$project".dependencies
+            $foundDependencies = @($dependencies | ForEach-Object {
+                $dependency = $_
+                $projects | Where-Object { $_ -ne $project -and $appDependencies."$_".apps -contains $dependency }
+            } | Select-Object -Unique)
+            if (!$projectDependencies.Value.ContainsKey($project)) {
+                $projectDependencies.value."$project" = $foundDependencies
+            }
+            if ($foundDependencies) {
+                Write-Host "Found dependencies to projects: $($foundDependencies -join ", ")"
+                $foundDependencies | ForEach-Object { 
+                    if ($buildAlso.value.ContainsKey($_)) {
+                        if ($buildAlso.value."$_" -notcontains $project) {
+                            $buildAlso.value."$_" += @( $project )
+                        }
+                    }
+                    else {
+                        $buildAlso.value."$_" = @( $project )
+                    }
+                }
+            }
+            else {
+                Write-Host "No dependencies found"
+                $thisJob += $project
+            }
+        }
+        if ($thisJob.Count -eq 0) {
+            throw "Circular project reference encountered, cannot determine build order"
+        }
+        Write-Host "#$no - build projects: $($thisJob -join ", ")"
+        $projects = @($projects | Where-Object { $thisJob -notcontains $_ })
+        $buildOrder.value."$no" = @($thisJob)
+        $no++
     }
 }
